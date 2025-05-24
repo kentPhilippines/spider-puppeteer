@@ -53,6 +53,38 @@ error_exit() {
     exit 1
 }
 
+# 检查必要命令
+check_required_commands() {
+    log_info "检查系统必要命令..."
+    
+    local required_commands=("curl" "wget" "tar" "gzip")
+    local missing_commands=()
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_commands+=("$cmd")
+        fi
+    done
+    
+    if [ ${#missing_commands[@]} -gt 0 ]; then
+        log_warning "缺少命令工具，尝试安装："
+        for cmd in "${missing_commands[@]}"; do
+            echo "  - $cmd"
+        done
+        
+        # 尝试安装基础工具
+        if [ "$OS" = "ubuntu" ]; then
+            sudo apt-get update && sudo apt-get install -y curl wget tar gzip
+        elif [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ]; then
+            sudo yum install -y curl wget tar gzip
+        elif [ "$OS" = "fedora" ]; then
+            sudo dnf install -y curl wget tar gzip
+        fi
+    fi
+    
+    log_success "系统命令检查完成"
+}
+
 # 检查必要文件
 check_required_files() {
     log_info "检查必要文件..."
@@ -88,11 +120,32 @@ check_required_files() {
 check_root() {
     if [[ $EUID -eq 0 ]]; then
         log_warning "检测到root用户，建议使用普通用户运行"
-        read -p "是否继续? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
-        fi
+        log_warning "root用户运行可能存在安全风险"
+        
+        # 提供创建普通用户的选项
+        echo "选项："
+        echo "1) 继续使用root用户 (不推荐)"
+        echo "2) 创建新用户spider并切换"
+        echo "3) 退出部署"
+        
+        read -p "请选择 (1/2/3): " choice
+        
+        case $choice in
+            1)
+                log_warning "继续使用root用户部署"
+                ;;
+            2)
+                log_info "创建用户spider..."
+                useradd -m -s /bin/bash spider 2>/dev/null || true
+                usermod -aG sudo spider 2>/dev/null || usermod -aG wheel spider 2>/dev/null || true
+                log_info "请切换到spider用户后重新运行脚本："
+                log_info "su - spider"
+                exit 0
+                ;;
+            3|*)
+                exit 1
+                ;;
+        esac
     fi
 }
 
@@ -477,10 +530,39 @@ install_pm2() {
     # 设置PM2开机自启 (小心处理)
     log_info "配置PM2开机自启..."
     
-    local startup_cmd=$(pm2 startup 2>/dev/null | grep -E '^sudo' | head -1)
-    if [ -n "$startup_cmd" ]; then
-        eval "$startup_cmd" || log_warning "PM2开机自启配置失败，请稍后手动执行: $startup_cmd"
+    if pm2 startup 2>/dev/null | grep -q "sudo"; then
+        local startup_cmd=$(pm2 startup 2>/dev/null | grep -E '^sudo' | head -1)
+        if [ -n "$startup_cmd" ]; then
+            log_warning "需要手动执行PM2开机自启命令:"
+            log_warning "$startup_cmd"
+            log_warning "部署完成后请手动执行该命令"
+        fi
+    else
+        log_success "PM2开机自启配置完成"
     fi
+}
+
+# 手动复制文件函数
+manual_copy_files() {
+    log_info "手动复制文件..."
+    
+    # 复制所有文件
+    find . -maxdepth 1 -type f -exec cp {} "$PROJECT_DIR/" \; 2>/dev/null || true
+    
+    # 复制目录，排除大目录
+    for item in *; do
+        if [ -d "$item" ]; then
+            case "$item" in
+                node_modules|.git|logs|output)
+                    log_info "跳过目录: $item"
+                    ;;
+                *)
+                    log_info "复制目录: $item"
+                    cp -r "$item" "$PROJECT_DIR/" 2>/dev/null || true
+                    ;;
+            esac
+        fi
+    done
 }
 
 # 创建项目目录
@@ -507,15 +589,12 @@ setup_project() {
         
         # 使用rsync复制，避免大文件
         if command -v rsync >/dev/null 2>&1; then
-            rsync -av $rsync_excludes . "$PROJECT_DIR/"
+            rsync -av $rsync_excludes . "$PROJECT_DIR/" || {
+                log_warning "rsync复制失败，尝试手动复制..."
+                manual_copy_files
+            }
         else
-            # 手动复制，排除大目录
-            find . -maxdepth 1 -type f -exec cp {} "$PROJECT_DIR/" \; 2>/dev/null || true
-            for dir in */; do
-                if [[ ! "$dir" =~ ^(node_modules|\.git|logs|output)/ ]]; then
-                    cp -r "$dir" "$PROJECT_DIR/" 2>/dev/null || true
-                fi
-            done
+            manual_copy_files
         fi
         
         cd "$PROJECT_DIR"
@@ -563,8 +642,31 @@ API_TIMEOUT=30000
 
 # Puppeteer配置
 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
-PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+PUPPETEER_EXECUTABLE_PATH=__CHROME_PATH__
 EOF
+        
+        # 检测Chrome安装路径并更新.env文件
+        local chrome_path=""
+        if command -v google-chrome-stable >/dev/null 2>&1; then
+            chrome_path=$(which google-chrome-stable)
+        elif command -v google-chrome >/dev/null 2>&1; then
+            chrome_path=$(which google-chrome)
+        elif command -v chromium-browser >/dev/null 2>&1; then
+            chrome_path=$(which chromium-browser)
+        elif command -v chromium >/dev/null 2>&1; then
+            chrome_path=$(which chromium)
+        else
+            chrome_path="/usr/bin/google-chrome-stable"
+        fi
+        
+        # 更新.env文件中的Chrome路径
+        if [ "$(uname)" = "Darwin" ]; then
+            sed -i '' "s|__CHROME_PATH__|$chrome_path|g" .env
+        else
+            sed -i "s|__CHROME_PATH__|$chrome_path|g" .env
+        fi
+        
+        log_info "Chrome路径设置为: $chrome_path"
         log_success "环境配置文件创建完成"
     else
         log_success "环境配置文件已存在"
@@ -592,14 +694,31 @@ install_dependencies() {
     
     # 设置npm配置以提高安装成功率
     npm config set registry https://registry.npmjs.org/
-    npm config set timeout 300000
+    npm config set fetch-timeout 300000 2>/dev/null || true
+    npm config set fetch-retry-maxtimeout 120000 2>/dev/null || true
+    npm config set fetch-retry-mintimeout 10000 2>/dev/null || true
     
     # 安装npm依赖
     log_info "执行npm install..."
-    if ! npm install --production --no-audit --no-fund; then
+    
+    # 设置npm超时和重试
+    export NPM_CONFIG_FETCH_TIMEOUT=300000
+    export NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000
+    export NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=10000
+    
+    if ! npm install --production --no-audit --no-fund --no-optional; then
         log_warning "npm install失败，尝试清理缓存后重试..."
-        npm cache clean --force
-        npm install --production --no-audit --no-fund || error_exit "npm依赖安装失败"
+        npm cache clean --force 2>/dev/null || true
+        rm -rf node_modules package-lock.json 2>/dev/null || true
+        
+        # 尝试使用yarn作为备选
+        if command -v yarn >/dev/null 2>&1; then
+            log_info "尝试使用yarn安装依赖..."
+            yarn install --production --no-lockfile || error_exit "yarn依赖安装失败"
+        else
+            # 重试npm安装
+            npm install --production --no-audit --no-fund --no-optional || error_exit "npm依赖安装失败"
+        fi
     fi
     
     # 验证关键依赖
@@ -609,8 +728,23 @@ install_dependencies() {
     
     # 安装Puppeteer的Chromium
     log_info "安装Puppeteer Chrome浏览器..."
-    if ! npx puppeteer browsers install chrome; then
+    
+    # 设置Puppeteer缓存目录
+    export PUPPETEER_CACHE_DIR="$HOME/.cache/puppeteer"
+    mkdir -p "$PUPPETEER_CACHE_DIR"
+    
+    if ! timeout 300 npx puppeteer browsers install chrome 2>/dev/null; then
         log_warning "Puppeteer Chrome安装失败，将使用系统Chrome"
+        
+        # 检查系统Chrome是否可用
+        if command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1; then
+            log_info "检测到系统Chrome，将使用系统浏览器"
+            export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+        else
+            log_warning "未检测到可用的Chrome浏览器，可能影响功能"
+        fi
+    else
+        log_success "Puppeteer Chrome安装成功"
     fi
     
     log_success "项目依赖安装完成"
@@ -842,11 +976,24 @@ start_service() {
     pm2 save
     
     # 验证服务状态
-    if pm2 list | grep -q "spider-server.*online"; then
-        log_success "服务启动完成"
-    else
+    local retry_count=0
+    local max_retries=5
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if pm2 list 2>/dev/null | grep -q "spider-server.*online"; then
+            log_success "服务启动完成"
+            break
+        else
+            retry_count=$((retry_count + 1))
+            log_info "等待服务启动... (尝试 $retry_count/$max_retries)"
+            sleep 3
+        fi
+    done
+    
+    if [ $retry_count -eq $max_retries ]; then
         log_error "服务启动失败"
-        pm2 logs spider-server --lines 20
+        pm2 logs spider-server --lines 20 2>/dev/null || true
+        pm2 describe spider-server 2>/dev/null || true
         error_exit "服务验证失败"
     fi
     
@@ -917,6 +1064,25 @@ EOF
     fi
 }
 
+# 清理临时文件
+cleanup_temp_files() {
+    log_info "清理临时文件..."
+    
+    # 清理npm缓存
+    npm cache clean --force 2>/dev/null || true
+    
+    # 清理下载的临时文件
+    rm -f /tmp/google-chrome-stable_current_x86_64.rpm 2>/dev/null || true
+    rm -f /tmp/epel-release.rpm 2>/dev/null || true
+    
+    # 清理构建缓存
+    if [ -d "$HOME/.npm" ]; then
+        find "$HOME/.npm" -name "*.tgz" -mtime +7 -delete 2>/dev/null || true
+    fi
+    
+    log_success "临时文件清理完成"
+}
+
 # 显示部署总结
 show_deployment_summary() {
     local end_time=$(date +%s)
@@ -975,6 +1141,7 @@ main() {
     check_required_files
     check_root
     check_os
+    check_required_commands
     
     # 修复EPEL仓库冲突（在安装依赖前）
     fix_epel_conflict
@@ -1008,10 +1175,34 @@ main() {
     
     # 显示总结
     show_deployment_summary
+    
+    # 清理临时文件
+    cleanup_temp_files
 }
 
 # 错误处理
-trap 'error_exit "部署过程中发生未预期的错误"' ERR
+# 清理和错误处理
+cleanup_on_exit() {
+    local exit_code=$?
+    
+    # 如果是正常退出，不输出错误信息
+    if [ $exit_code -eq 0 ]; then
+        log_success "部署脚本执行完成"
+    else
+        log_error "部署过程中发生错误 (退出码: $exit_code)"
+        log_error "查看详细日志: $INSTALL_LOG"
+        echo ""
+        echo "最后几行日志:"
+        tail -10 "$INSTALL_LOG" 2>/dev/null || echo "无法读取日志文件"
+        echo ""
+        echo "故障排除建议:"
+        echo "1. 检查网络连接是否正常"
+        echo "2. 确认系统满足最低要求"
+        echo "3. 重新运行脚本或手动执行失败的步骤"
+    fi
+}
+
+trap cleanup_on_exit EXIT
 
 # 执行主函数
 main "$@" 
