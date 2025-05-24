@@ -84,10 +84,18 @@ check_os() {
             CHROMIUM_PKG="chromium-browser"
             log_success "检测到Ubuntu/Debian系统"
         elif command -v yum >/dev/null 2>&1; then
-            OS="centos"
-            PKG_MANAGER="yum"
-            CHROMIUM_PKG="chromium"
-            log_success "检测到CentOS/RHEL系统"
+            # 检查是否为阿里云系统
+            if grep -q "Alibaba Cloud Linux" /etc/os-release 2>/dev/null || grep -q "Aliyun Linux" /etc/os-release 2>/dev/null; then
+                OS="aliyun"
+                PKG_MANAGER="yum"
+                CHROMIUM_PKG="chromium"
+                log_success "检测到阿里云Linux系统"
+            else
+                OS="centos"
+                PKG_MANAGER="yum"
+                CHROMIUM_PKG="chromium"
+                log_success "检测到CentOS/RHEL系统"
+            fi
         elif command -v dnf >/dev/null 2>&1; then
             OS="fedora"
             PKG_MANAGER="dnf"
@@ -158,8 +166,8 @@ install_nodejs_force() {
         # Ubuntu/Debian安装
         curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
         sudo $PKG_MANAGER install -y nodejs
-    elif [ "$OS" = "centos" ]; then
-        # CentOS/RHEL安装
+    elif [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ]; then
+        # CentOS/RHEL/阿里云安装
         curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -
         sudo $PKG_MANAGER install -y nodejs npm
     elif [ "$OS" = "fedora" ]; then
@@ -215,13 +223,12 @@ install_system_deps() {
             libgtk-3-0 \
             libgdk-pixbuf2.0-0
             
-    elif [ "$OS" = "centos" ] || [ "$OS" = "fedora" ]; then
+    elif [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ] || [ "$OS" = "fedora" ]; then
         sudo $PKG_MANAGER update -y
         
-        if [ "$OS" = "centos" ]; then
+        if [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ]; then
             sudo $PKG_MANAGER groupinstall -y "Development Tools"
-            # 启用 EPEL 仓库
-            sudo $PKG_MANAGER install -y epel-release
+            # EPEL已在前面的步骤中处理
         fi
         
         sudo $PKG_MANAGER install -y \
@@ -279,7 +286,7 @@ install_chrome() {
         echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
         sudo $PKG_MANAGER update
         sudo $PKG_MANAGER install -y google-chrome-stable
-    elif [ "$OS" = "centos" ] || [ "$OS" = "fedora" ]; then
+    elif [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ] || [ "$OS" = "fedora" ]; then
         cat > /tmp/google-chrome.repo << 'EOF'
 [google-chrome]
 name=google-chrome
@@ -690,6 +697,59 @@ run_deployment_test() {
     fi
 }
 
+# 修复EPEL仓库冲突（专门针对阿里云服务器）
+fix_epel_conflict() {
+    if [ "$OS" = "aliyun" ] || [ "$OS" = "centos" ]; then
+        log_info "检查并修复EPEL仓库冲突..."
+        
+        # 检查是否存在EPEL冲突
+        if yum list installed | grep -q epel-aliyuncs-release; then
+            log_warning "检测到阿里云EPEL包冲突，正在修复..."
+            
+            # 移除冲突的包
+            sudo yum remove -y epel-aliyuncs-release epel-release 2>/dev/null || true
+            
+            # 清理缓存
+            sudo yum clean all
+            
+            # 重新安装EPEL
+            log_info "重新安装EPEL仓库..."
+            if ! sudo yum install -y epel-release --allowerasing; then
+                log_warning "标准EPEL安装失败，尝试手动安装..."
+                
+                # 手动下载安装EPEL
+                local epel_rpm=""
+                if grep -q "release 8" /etc/redhat-release 2>/dev/null; then
+                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm"
+                elif grep -q "release 7" /etc/redhat-release 2>/dev/null; then
+                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
+                fi
+                
+                if [ -n "$epel_rpm" ]; then
+                    sudo yum install -y "$epel_rpm" || log_warning "EPEL手动安装也失败，继续部署..."
+                fi
+            fi
+            
+            log_success "EPEL仓库冲突已修复"
+        else
+            # 正常安装EPEL
+            if ! yum list installed | grep -q epel-release; then
+                log_info "安装EPEL仓库..."
+                sudo yum install -y epel-release --allowerasing || log_warning "EPEL安装失败，继续部署..."
+            else
+                log_success "EPEL仓库已安装"
+            fi
+        fi
+        
+        # 验证EPEL仓库
+        if yum repolist 2>/dev/null | grep -q epel; then
+            log_success "EPEL仓库验证通过"
+        else
+            log_warning "EPEL仓库验证失败，但继续部署"
+        fi
+    fi
+}
+
 # 主函数
 main() {
     local start_time=$(date +%s)
@@ -702,6 +762,10 @@ main() {
     check_required_files
     check_root
     check_os
+    
+    # 修复EPEL仓库冲突（在安装依赖前）
+    fix_epel_conflict
+    
     check_system_resources
     
     # 安装依赖
