@@ -27,7 +27,7 @@
 
 ```bash
 # 1. 下载项目代码
-git clone https://github.com/your-username/spider-puppeteer.git
+git clone https://github.com/kentPhilippines/spider-puppeteer.git
 cd spider-puppeteer
 
 # 2. 设置执行权限

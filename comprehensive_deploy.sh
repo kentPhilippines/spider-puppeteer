@@ -787,23 +787,84 @@ configure_database() {
 configure_firewall() {
     log_info "配置防火墙..."
     
+    local firewall_configured=false
+    
     if command -v ufw >/dev/null 2>&1; then
-        # Ubuntu防火墙
-        sudo ufw allow ssh
-        sudo ufw allow 3000/tcp
-        log_success "防火墙配置完成 (ufw)"
+        log_info "检测到UFW防火墙，配置中..."
+        
+        # 检查UFW状态
+        if sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+            log_info "UFW已启用，添加规则..."
+            if sudo ufw allow ssh 2>/dev/null && sudo ufw allow 3000/tcp 2>/dev/null; then
+                log_success "防火墙配置完成 (ufw)"
+                firewall_configured=true
+            else
+                log_warning "UFW规则添加失败，可能权限不足"
+            fi
+        else
+            log_warning "UFW未启用，跳过防火墙配置"
+            log_warning "如需启用UFW，请手动执行: sudo ufw enable"
+            log_warning "然后添加规则: sudo ufw allow 3000/tcp"
+        fi
+        
     elif command -v firewall-cmd >/dev/null 2>&1; then
-        # CentOS防火墙
-        sudo firewall-cmd --permanent --add-port=3000/tcp
-        sudo firewall-cmd --reload
-        log_success "防火墙配置完成 (firewalld)"
+        log_info "检测到firewalld防火墙，配置中..."
+        
+        # 检查firewalld状态
+        if sudo systemctl is-active firewalld >/dev/null 2>&1; then
+            log_info "firewalld已启用，添加规则..."
+            if sudo firewall-cmd --permanent --add-port=3000/tcp 2>/dev/null && sudo firewall-cmd --reload 2>/dev/null; then
+                log_success "防火墙配置完成 (firewalld)"
+                firewall_configured=true
+            else
+                log_warning "firewalld规则添加失败"
+            fi
+        else
+            log_warning "firewalld未运行，跳过防火墙配置"
+            log_warning "如需启用firewalld，请手动执行: sudo systemctl start firewalld"
+            log_warning "然后添加规则: sudo firewall-cmd --permanent --add-port=3000/tcp && sudo firewall-cmd --reload"
+        fi
+        
     elif command -v iptables >/dev/null 2>&1; then
-        # 基本iptables配置
-        sudo iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
-        log_success "防火墙配置完成 (iptables)"
-    else
-        log_warning "未检测到防火墙，请手动配置端口3000"
+        log_info "检测到iptables，配置中..."
+        
+        # 检查当前规则是否已存在
+        if ! sudo iptables -C INPUT -p tcp --dport 3000 -j ACCEPT 2>/dev/null; then
+            if sudo iptables -A INPUT -p tcp --dport 3000 -j ACCEPT 2>/dev/null; then
+                log_success "防火墙配置完成 (iptables)"
+                log_warning "注意: iptables规则重启后会丢失，如需持久化请配置iptables-persistent"
+                firewall_configured=true
+            else
+                log_warning "iptables规则添加失败"
+            fi
+        else
+            log_success "iptables规则已存在"
+            firewall_configured=true
+        fi
     fi
+    
+    if [ "$firewall_configured" = false ]; then
+        log_warning "未检测到活跃的防火墙或配置失败"
+        log_warning "请手动确保端口3000可访问："
+        echo "  Ubuntu/Debian (UFW):  sudo ufw allow 3000/tcp"
+        echo "  CentOS/RHEL (firewalld): sudo firewall-cmd --permanent --add-port=3000/tcp && sudo firewall-cmd --reload"
+        echo "  通用 (iptables): sudo iptables -A INPUT -p tcp --dport 3000 -j ACCEPT"
+    fi
+    
+    # 检查端口是否被占用
+    if command -v netstat >/dev/null 2>&1; then
+        if netstat -tlnp 2>/dev/null | grep -q ":3000 "; then
+            log_warning "端口3000已被占用，请检查："
+            netstat -tlnp 2>/dev/null | grep ":3000 " | head -3
+        fi
+    elif command -v ss >/dev/null 2>&1; then
+        if ss -tlnp 2>/dev/null | grep -q ":3000 "; then
+            log_warning "端口3000已被占用，请检查："
+            ss -tlnp 2>/dev/null | grep ":3000 " | head -3
+        fi
+    fi
+    
+    log_success "防火墙配置检查完成"
 }
 
 # 创建管理脚本
@@ -1125,6 +1186,10 @@ show_deployment_summary() {
     echo "  - 检查状态: ./status.sh"
     echo "  - 运行测试: ./test.sh"
     echo ""
+    echo "📝 注意事项:"
+    echo "  - 防火墙配置已跳过，如需要请手动配置端口3000"
+    echo "  - 如果服务无法外部访问，请检查网络和端口设置"
+    echo ""
     echo "✅ 部署成功！服务已启动并运行。"
 }
 
@@ -1161,7 +1226,7 @@ main() {
     
     # 配置服务
     configure_database
-    configure_firewall
+    # configure_firewall  # 跳过防火墙配置
     create_management_scripts
     
     # 创建systemd服务 (如果指定)
