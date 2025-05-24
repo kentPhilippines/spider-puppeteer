@@ -1,0 +1,53 @@
+{
+  "name": "spider-puppeteer",
+  "version": "1.0.0",
+  "description": "体育赛事数据爬取工具",
+  "main": "scrape.js",
+  "scripts": {
+    "start": "node server_manager.js",
+    "batch": "node scrape.js --batchMode true",
+    "monitor": "node scrape.js --monitorMode true",
+    "test": "node scrape.js --inplay false --maxMatches 1",
+    "dev": "node scrape.js",
+    "pm2:start": "pm2 start ecosystem.config.js --env production",
+    "pm2:stop": "pm2 stop spider-server",
+    "pm2:restart": "pm2 restart spider-server",
+    "pm2:logs": "pm2 logs spider-server",
+    "database:check": "node check_database.js",
+    "database:query": "node database_query.js"
+  },
+  "dependencies": {
+    "puppeteer": "^21.5.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "mysql2": "^3.6.5",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12",
+    "user-agents": "^1.0.1262",
+    "dotenv": "^16.3.1",
+    "winston": "^3.11.0",
+    "cron": "^3.1.6",
+    "express": "^4.18.2",
+    "pm2": "^5.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "puppeteer",
+    "scraper",
+    "sports",
+    "data-collection",
+    "automation"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/spider-puppeteer.git"
+  }
+} 
