@@ -1,10 +1,13 @@
 #!/bin/bash
 
-# 体育赛事爬虫 - Linux服务器部署脚本 (修复版)
+# 体育赛事爬虫 - 综合部署脚本 (完整版)
+# 集成所有修复方案和冲突解决
 
 set -e
 
 echo "🚀 开始部署体育赛事爬虫到Linux服务器..."
+echo "📅 部署时间: $(date)"
+echo "🖥️  系统信息: $(uname -a)"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -13,21 +16,41 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# 全局变量
+DEPLOY_START_TIME=$(date +%s)
+PROJECT_DIR="/var/www/spider-puppeteer"
+INSTALL_LOG="/tmp/spider_deploy.log"
+
 # 日志函数
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    local message="[INFO] $1"
+    echo -e "${BLUE}${message}${NC}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${message}" >> "$INSTALL_LOG"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    local message="[SUCCESS] $1"
+    echo -e "${GREEN}${message}${NC}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${message}" >> "$INSTALL_LOG"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    local message="[WARNING] $1"
+    echo -e "${YELLOW}${message}${NC}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${message}" >> "$INSTALL_LOG"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    local message="[ERROR] $1"
+    echo -e "${RED}${message}${NC}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') ${message}" >> "$INSTALL_LOG"
+}
+
+# 错误处理
+error_exit() {
+    log_error "$1"
+    log_error "部署失败！查看日志: $INSTALL_LOG"
+    exit 1
 }
 
 # 检查必要文件
@@ -55,7 +78,7 @@ check_required_files() {
         for file in "${missing_files[@]}"; do
             echo "  - $file"
         done
-        exit 1
+        error_exit "请确保所有必要文件都存在"
     fi
     
     log_success "所有必要文件检查通过"
@@ -102,12 +125,67 @@ check_os() {
             CHROMIUM_PKG="chromium"
             log_success "检测到Fedora系统"
         else
-            log_error "不支持的Linux发行版"
-            exit 1
+            error_exit "不支持的Linux发行版"
         fi
     else
-        log_error "不支持的操作系统: $OSTYPE"
-        exit 1
+        error_exit "不支持的操作系统: $OSTYPE"
+    fi
+}
+
+# 修复EPEL仓库冲突（专门针对阿里云服务器）
+fix_epel_conflict() {
+    if [ "$OS" = "aliyun" ] || [ "$OS" = "centos" ]; then
+        log_info "检查并修复EPEL仓库冲突..."
+        
+        # 检查是否存在EPEL冲突
+        if yum list installed 2>/dev/null | grep -q epel-aliyuncs-release; then
+            log_warning "检测到阿里云EPEL包冲突，正在修复..."
+            
+            # 移除冲突的包
+            sudo yum remove -y epel-aliyuncs-release epel-release 2>/dev/null || true
+            
+            # 清理缓存
+            sudo yum clean all
+            
+            # 重新安装EPEL
+            log_info "重新安装EPEL仓库..."
+            if ! sudo yum install -y epel-release --allowerasing; then
+                log_warning "标准EPEL安装失败，尝试手动安装..."
+                
+                # 手动下载安装EPEL
+                local epel_rpm=""
+                if grep -q "release 8" /etc/redhat-release 2>/dev/null; then
+                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm"
+                elif grep -q "release 7" /etc/redhat-release 2>/dev/null; then
+                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
+                elif grep -q "release 9" /etc/redhat-release 2>/dev/null; then
+                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
+                fi
+                
+                if [ -n "$epel_rpm" ]; then
+                    if wget -q "$epel_rpm" -O /tmp/epel-release.rpm; then
+                        sudo yum localinstall -y /tmp/epel-release.rpm || log_warning "EPEL手动安装也失败，继续部署..."
+                    fi
+                fi
+            fi
+            
+            log_success "EPEL仓库冲突已修复"
+        else
+            # 正常安装EPEL
+            if ! yum list installed 2>/dev/null | grep -q epel-release; then
+                log_info "安装EPEL仓库..."
+                sudo yum install -y epel-release --allowerasing || log_warning "EPEL安装失败，继续部署..."
+            else
+                log_success "EPEL仓库已安装"
+            fi
+        fi
+        
+        # 验证EPEL仓库
+        if yum repolist 2>/dev/null | grep -q epel; then
+            log_success "EPEL仓库验证通过"
+        else
+            log_warning "EPEL仓库验证失败，但继续部署"
+        fi
     fi
 }
 
@@ -118,13 +196,30 @@ check_system_resources() {
     # 检查内存
     local mem_total=$(free -m | awk 'NR==2{printf "%.0f", $2}')
     if [ "$mem_total" -lt 1024 ]; then
-        log_warning "系统内存不足1GB，可能影响性能"
+        log_warning "系统内存不足1GB (当前: ${mem_total}MB)，可能影响性能"
+        log_info "建议创建交换文件..."
+        
+        # 自动创建交换文件
+        if [ ! -f /swapfile ]; then
+            log_info "创建2GB交换文件..."
+            sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+            log_success "交换文件创建完成"
+        fi
+    else
+        log_success "内存检查通过 (${mem_total}MB)"
     fi
     
     # 检查磁盘空间
     local disk_available=$(df / | tail -1 | awk '{print $4}')
+    local disk_available_gb=$((disk_available / 1024 / 1024))
     if [ "$disk_available" -lt 2097152 ]; then # 2GB in KB
-        log_warning "根目录可用空间不足2GB"
+        log_warning "根目录可用空间不足2GB (当前: ${disk_available_gb}GB)"
+    else
+        log_success "磁盘空间检查通过 (可用: ${disk_available_gb}GB)"
     fi
     
     log_success "系统资源检查完成"
@@ -151,14 +246,14 @@ install_nodejs() {
     
     # 验证安装
     if ! command -v node >/dev/null 2>&1; then
-        log_error "Node.js安装失败"
-        exit 1
+        error_exit "Node.js安装失败"
     fi
     
     if ! command -v npm >/dev/null 2>&1; then
-        log_error "npm安装失败"
-        exit 1
+        error_exit "npm安装失败"
     fi
+    
+    log_success "Node.js验证通过: $(node --version), npm: $(npm --version)"
 }
 
 install_nodejs_force() {
@@ -215,13 +310,9 @@ install_system_deps() {
             libcairo2 \
             libdbus-1-3 \
             libxtst6 \
-            libxrandr2 \
-            libasound2 \
             libpangocairo-1.0-0 \
             libatk1.0-0 \
-            libcairo-gobject2 \
-            libgtk-3-0 \
-            libgdk-pixbuf2.0-0
+            libcairo-gobject2
             
     elif [ "$OS" = "centos" ] || [ "$OS" = "aliyun" ] || [ "$OS" = "fedora" ]; then
         sudo $PKG_MANAGER update -y
@@ -260,6 +351,8 @@ install_system_deps() {
         
         # 针对阿里云Linux的特殊处理
         if [ "$OS" = "aliyun" ]; then
+            log_info "安装阿里云Linux特殊依赖..."
+            
             # 安装X11屏保扩展库 (libXss的替代)
             sudo $PKG_MANAGER install -y libXScrnSaver libXScrnSaver-devel || true
             
@@ -276,6 +369,12 @@ install_system_deps() {
                     dejavu-sans-fonts \
                     dejavu-serif-fonts || true
             }
+            
+            # 安装其他Puppeteer依赖
+            sudo $PKG_MANAGER install -y \
+                libxkbcommon \
+                libgbm || true
+                
         else
             # 标准CentOS/RHEL包
             sudo $PKG_MANAGER install -y \
@@ -286,25 +385,23 @@ install_system_deps() {
     
     # 验证关键依赖
     if ! command -v git >/dev/null 2>&1; then
-        log_error "git安装失败"
-        exit 1
+        error_exit "git安装失败"
     fi
     
     log_success "系统依赖安装完成"
 }
 
-# 安装Google Chrome (如果需要)
+# 安装Google Chrome
 install_chrome() {
-    log_info "检查Chrome浏览器..."
+    log_info "安装Google Chrome浏览器..."
     
     if command -v google-chrome >/dev/null 2>&1; then
-        log_success "Chrome已安装"
+        log_success "Chrome已安装: $(google-chrome --version 2>/dev/null | head -1 || echo 'Unknown version')"
         return
     fi
     
-    log_info "安装Google Chrome..."
-    
     if [ "$OS" = "ubuntu" ]; then
+        # Ubuntu安装
         wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
         echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
         sudo $PKG_MANAGER update
@@ -371,8 +468,7 @@ install_pm2() {
         
         # 验证安装
         if ! command -v pm2 >/dev/null 2>&1; then
-            log_error "PM2安装失败"
-            exit 1
+            error_exit "PM2安装失败"
         fi
         
         log_success "PM2安装完成"
@@ -381,17 +477,15 @@ install_pm2() {
     # 设置PM2开机自启 (小心处理)
     log_info "配置PM2开机自启..."
     
-    local startup_cmd=$(pm2 startup | grep -E '^sudo' | head -1)
+    local startup_cmd=$(pm2 startup 2>/dev/null | grep -E '^sudo' | head -1)
     if [ -n "$startup_cmd" ]; then
-        eval "$startup_cmd" || log_warning "PM2开机自启配置失败，请手动执行: $startup_cmd"
+        eval "$startup_cmd" || log_warning "PM2开机自启配置失败，请稍后手动执行: $startup_cmd"
     fi
 }
 
 # 创建项目目录
 setup_project() {
     log_info "设置项目目录..."
-    
-    PROJECT_DIR="/var/www/spider-puppeteer"
     
     # 创建项目目录
     if [ ! -d "$PROJECT_DIR" ]; then
@@ -404,7 +498,7 @@ setup_project() {
         log_info "复制项目文件到 $PROJECT_DIR"
         
         # 创建临时排除文件列表
-        local exclude_dirs=("node_modules" ".git" "logs" "output" "*.log")
+        local exclude_dirs=("node_modules" ".git" "logs" "output" "*.log" "*.pid")
         local rsync_excludes=""
         
         for exclude in "${exclude_dirs[@]}"; do
@@ -415,24 +509,66 @@ setup_project() {
         if command -v rsync >/dev/null 2>&1; then
             rsync -av $rsync_excludes . "$PROJECT_DIR/"
         else
-            cp -r . "$PROJECT_DIR/"
+            # 手动复制，排除大目录
+            find . -maxdepth 1 -type f -exec cp {} "$PROJECT_DIR/" \; 2>/dev/null || true
+            for dir in */; do
+                if [[ ! "$dir" =~ ^(node_modules|\.git|logs|output)/ ]]; then
+                    cp -r "$dir" "$PROJECT_DIR/" 2>/dev/null || true
+                fi
+            done
         fi
         
         cd "$PROJECT_DIR"
     fi
     
     # 创建必要的目录
-    mkdir -p logs
-    mkdir -p output
-    mkdir -p temp
+    mkdir -p logs output temp
     
     # 设置正确的权限
     chmod 755 "$PROJECT_DIR"
-    chmod -R 644 "$PROJECT_DIR"/*
-    chmod +x "$PROJECT_DIR"/*.sh
-    chmod +x "$PROJECT_DIR"/*.js
+    find "$PROJECT_DIR" -type f -name "*.sh" -exec chmod +x {} \;
+    find "$PROJECT_DIR" -type f -name "*.js" -exec chmod +x {} \;
     
     log_success "项目目录设置完成: $PROJECT_DIR"
+}
+
+# 创建环境配置文件
+create_env_config() {
+    log_info "创建环境配置文件..."
+    
+    if [ ! -f ".env" ]; then
+        cat > .env << 'EOF'
+# 生产环境配置
+NODE_ENV=production
+PORT=3000
+
+# 爬虫配置
+HEADLESS=true
+REQUEST_DELAY=1000
+MAX_RETRIES=3
+
+# 数据库配置 (请根据实际情况修改)
+DB_HOST=localhost
+DB_USER=spider
+DB_PASSWORD=your_password
+DB_NAME=sports_data
+
+# 日志配置
+LOG_LEVEL=info
+LOG_MAX_SIZE=50MB
+LOG_MAX_FILES=7
+
+# API配置
+API_TIMEOUT=30000
+
+# Puppeteer配置
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
+PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+EOF
+        log_success "环境配置文件创建完成"
+    else
+        log_success "环境配置文件已存在"
+    fi
 }
 
 # 安装项目依赖
@@ -441,8 +577,7 @@ install_dependencies() {
     
     # 检查package.json
     if [ ! -f "package.json" ]; then
-        log_error "package.json文件不存在"
-        exit 1
+        error_exit "package.json文件不存在"
     fi
     
     # 清理可能的旧依赖
@@ -455,19 +590,28 @@ install_dependencies() {
         rm -f package-lock.json
     fi
     
+    # 设置npm配置以提高安装成功率
+    npm config set registry https://registry.npmjs.org/
+    npm config set timeout 300000
+    
     # 安装npm依赖
     log_info "执行npm install..."
-    npm install --production
+    if ! npm install --production --no-audit --no-fund; then
+        log_warning "npm install失败，尝试清理缓存后重试..."
+        npm cache clean --force
+        npm install --production --no-audit --no-fund || error_exit "npm依赖安装失败"
+    fi
     
     # 验证关键依赖
     if [ ! -d "node_modules/puppeteer" ]; then
-        log_error "Puppeteer安装失败"
-        exit 1
+        error_exit "Puppeteer安装失败"
     fi
     
     # 安装Puppeteer的Chromium
     log_info "安装Puppeteer Chrome浏览器..."
-    npx puppeteer browsers install chrome
+    if ! npx puppeteer browsers install chrome; then
+        log_warning "Puppeteer Chrome安装失败，将使用系统Chrome"
+    fi
     
     log_success "项目依赖安装完成"
 }
@@ -493,7 +637,7 @@ configure_database() {
                     console.error('数据库连接失败:', err.message); 
                     process.exit(1); 
                 })
-        "; then
+        " 2>/dev/null; then
             log_success "数据库连接测试通过"
         else
             log_warning "数据库连接测试失败，服务仍将启动"
@@ -526,78 +670,6 @@ configure_firewall() {
     else
         log_warning "未检测到防火墙，请手动配置端口3000"
     fi
-}
-
-# 创建环境配置文件
-create_env_config() {
-    log_info "创建环境配置文件..."
-    
-    if [ ! -f ".env" ]; then
-        cat > .env << 'EOF'
-# 生产环境配置
-NODE_ENV=production
-PORT=3000
-
-# 爬虫配置
-HEADLESS=true
-REQUEST_DELAY=1000
-MAX_RETRIES=3
-
-# 数据库配置 (请根据实际情况修改)
-DB_HOST=localhost
-DB_USER=spider
-DB_PASSWORD=your_password
-DB_NAME=sports_data
-
-# 日志配置
-LOG_LEVEL=info
-LOG_MAX_SIZE=50MB
-LOG_MAX_FILES=7
-
-# API配置
-API_TIMEOUT=30000
-EOF
-        log_success "环境配置文件创建完成"
-    else
-        log_success "环境配置文件已存在"
-    fi
-}
-
-# 启动服务
-start_service() {
-    log_info "启动爬虫服务..."
-    
-    # 停止现有进程
-    pm2 delete spider-server 2>/dev/null || true
-    pm2 kill 2>/dev/null || true
-    
-    # 等待进程完全停止
-    sleep 3
-    
-    # 启动新进程
-    log_info "启动PM2进程..."
-    pm2 start ecosystem.config.js --env production
-    
-    # 等待服务启动
-    sleep 5
-    
-    # 保存PM2配置
-    pm2 save
-    
-    # 验证服务状态
-    if pm2 list | grep -q "spider-server.*online"; then
-        log_success "服务启动完成"
-    else
-        log_error "服务启动失败"
-        pm2 logs spider-server --lines 20
-        exit 1
-    fi
-    
-    # 显示状态
-    pm2 status
-    echo
-    echo "最新日志："
-    pm2 logs spider-server --lines 10
 }
 
 # 创建管理脚本
@@ -675,7 +747,7 @@ else
     echo "使用方法: ./logs.sh [batch|monitor|server|pm2|all]"
     echo ""
     echo "可用日志文件:"
-    ls -la logs/
+    ls -la logs/ 2>/dev/null || echo "logs目录不存在"
 fi
 EOF
     
@@ -702,10 +774,115 @@ pm2 restart spider-server
 echo "更新完成"
 EOF
     
+    # 创建测试脚本
+    cat > test.sh << 'EOF'
+#!/bin/bash
+echo "运行爬虫测试..."
+cd /var/www/spider-puppeteer
+
+echo "测试基本功能..."
+node scrape.js --inplay false --maxMatches 1 --requestDelay 2000
+
+echo "测试数据库连接..."
+node check_database.js 2>/dev/null || echo "数据库连接测试跳过"
+
+echo "测试完成"
+EOF
+    
+    # 创建备份脚本
+    cat > backup.sh << 'EOF'
+#!/bin/bash
+echo "备份爬虫数据..."
+cd /var/www/spider-puppeteer
+
+backup_dir="/tmp/spider_backup_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$backup_dir"
+
+# 备份配置文件
+cp .env "$backup_dir/" 2>/dev/null || true
+cp -r logs "$backup_dir/" 2>/dev/null || true
+cp -r output "$backup_dir/" 2>/dev/null || true
+
+# 备份数据库 (如果配置了)
+if [ -f "database.js" ]; then
+    echo "备份数据库..."
+    # 这里可以添加数据库备份逻辑
+fi
+
+echo "备份完成: $backup_dir"
+EOF
+    
     # 设置执行权限
-    chmod +x start.sh stop.sh restart.sh status.sh logs.sh update.sh
+    chmod +x start.sh stop.sh restart.sh status.sh logs.sh update.sh test.sh backup.sh
     
     log_success "管理脚本创建完成"
+}
+
+# 启动服务
+start_service() {
+    log_info "启动爬虫服务..."
+    
+    # 停止现有进程
+    pm2 delete spider-server 2>/dev/null || true
+    pm2 kill 2>/dev/null || true
+    
+    # 等待进程完全停止
+    sleep 3
+    
+    # 启动新进程
+    log_info "启动PM2进程..."
+    if ! pm2 start ecosystem.config.js --env production; then
+        error_exit "PM2启动失败"
+    fi
+    
+    # 等待服务启动
+    sleep 5
+    
+    # 保存PM2配置
+    pm2 save
+    
+    # 验证服务状态
+    if pm2 list | grep -q "spider-server.*online"; then
+        log_success "服务启动完成"
+    else
+        log_error "服务启动失败"
+        pm2 logs spider-server --lines 20
+        error_exit "服务验证失败"
+    fi
+    
+    # 显示状态
+    pm2 status
+    echo
+    echo "最新日志："
+    pm2 logs spider-server --lines 10
+}
+
+# 运行部署测试
+run_deployment_test() {
+    log_info "运行部署测试..."
+    
+    # 测试Node.js和npm
+    log_info "测试Node.js环境..."
+    node --version || error_exit "Node.js测试失败"
+    npm --version || error_exit "npm测试失败"
+    
+    # 测试浏览器
+    log_info "测试浏览器可用性..."
+    if command -v google-chrome >/dev/null 2>&1; then
+        google-chrome --version || log_warning "Chrome版本检查失败"
+    elif command -v chromium >/dev/null 2>&1; then
+        chromium --version || log_warning "Chromium版本检查失败"
+    fi
+    
+    # 测试基本功能
+    log_info "测试爬虫基本功能..."
+    if timeout 60 node scrape.js --inplay false --maxMatches 1 --requestDelay 2000; then
+        log_success "爬虫基本功能测试通过"
+    else
+        log_warning "爬虫功能测试失败，但部署继续"
+    fi
+    
+    log_success "部署测试完成"
 }
 
 # 创建系统服务 (可选)
@@ -721,7 +898,7 @@ After=network.target
 [Service]
 Type=forking
 User=$USER
-WorkingDirectory=/var/www/spider-puppeteer
+WorkingDirectory=$PROJECT_DIR
 ExecStart=/usr/bin/pm2 start ecosystem.config.js --env production
 ExecReload=/usr/bin/pm2 restart spider-server
 ExecStop=/usr/bin/pm2 stop spider-server
@@ -740,80 +917,59 @@ EOF
     fi
 }
 
-# 运行部署测试
-run_deployment_test() {
-    log_info "运行部署测试..."
+# 显示部署总结
+show_deployment_summary() {
+    local end_time=$(date +%s)
+    local duration=$((end_time - DEPLOY_START_TIME))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
     
-    # 测试基本功能
-    log_info "测试爬虫基本功能..."
-    
-    if timeout 60 node scrape.js --inplay false --maxMatches 1 --requestDelay 2000; then
-        log_success "爬虫基本功能测试通过"
-    else
-        log_warning "爬虫功能测试失败，但部署继续"
-    fi
-}
-
-# 修复EPEL仓库冲突（专门针对阿里云服务器）
-fix_epel_conflict() {
-    if [ "$OS" = "aliyun" ] || [ "$OS" = "centos" ]; then
-        log_info "检查并修复EPEL仓库冲突..."
-        
-        # 检查是否存在EPEL冲突
-        if yum list installed | grep -q epel-aliyuncs-release; then
-            log_warning "检测到阿里云EPEL包冲突，正在修复..."
-            
-            # 移除冲突的包
-            sudo yum remove -y epel-aliyuncs-release epel-release 2>/dev/null || true
-            
-            # 清理缓存
-            sudo yum clean all
-            
-            # 重新安装EPEL
-            log_info "重新安装EPEL仓库..."
-            if ! sudo yum install -y epel-release --allowerasing; then
-                log_warning "标准EPEL安装失败，尝试手动安装..."
-                
-                # 手动下载安装EPEL
-                local epel_rpm=""
-                if grep -q "release 8" /etc/redhat-release 2>/dev/null; then
-                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm"
-                elif grep -q "release 7" /etc/redhat-release 2>/dev/null; then
-                    epel_rpm="https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
-                fi
-                
-                if [ -n "$epel_rpm" ]; then
-                    sudo yum install -y "$epel_rpm" || log_warning "EPEL手动安装也失败，继续部署..."
-                fi
-            fi
-            
-            log_success "EPEL仓库冲突已修复"
-        else
-            # 正常安装EPEL
-            if ! yum list installed | grep -q epel-release; then
-                log_info "安装EPEL仓库..."
-                sudo yum install -y epel-release --allowerasing || log_warning "EPEL安装失败，继续部署..."
-            else
-                log_success "EPEL仓库已安装"
-            fi
-        fi
-        
-        # 验证EPEL仓库
-        if yum repolist 2>/dev/null | grep -q epel; then
-            log_success "EPEL仓库验证通过"
-        else
-            log_warning "EPEL仓库验证失败，但继续部署"
-        fi
-    fi
+    echo ""
+    echo "========================================="
+    log_success "🎉 部署完成！(耗时: ${minutes}分${seconds}秒)"
+    echo "========================================="
+    echo ""
+    echo "📋 管理命令:"
+    echo "  ./start.sh     - 启动服务"
+    echo "  ./stop.sh      - 停止服务"
+    echo "  ./restart.sh   - 重启服务"
+    echo "  ./status.sh    - 查看状态"
+    echo "  ./logs.sh      - 查看日志"
+    echo "  ./update.sh    - 更新代码"
+    echo "  ./test.sh      - 运行测试"
+    echo "  ./backup.sh    - 备份数据"
+    echo ""
+    echo "📊 PM2 命令:"
+    echo "  pm2 status                    - 查看进程状态"
+    echo "  pm2 logs spider-server        - 查看实时日志"
+    echo "  pm2 monit                     - 进程监控"
+    echo "  pm2 restart spider-server     - 重启服务"
+    echo ""
+    echo "📁 项目目录: $PROJECT_DIR"
+    echo "📝 日志目录: $PROJECT_DIR/logs"
+    echo "⚙️  环境配置: $PROJECT_DIR/.env"
+    echo "📋 部署日志: $INSTALL_LOG"
+    echo ""
+    echo "🔗 服务状态检查: ./status.sh"
+    echo "📊 监控URL: http://$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'localhost'):3000 (如果启用了Web监控)"
+    echo ""
+    echo "🔧 故障排除:"
+    echo "  - 查看日志: ./logs.sh pm2"
+    echo "  - 重启服务: ./restart.sh"
+    echo "  - 检查状态: ./status.sh"
+    echo "  - 运行测试: ./test.sh"
+    echo ""
+    echo "✅ 部署成功！服务已启动并运行。"
 }
 
 # 主函数
 main() {
-    local start_time=$(date +%s)
+    echo "========================================="
+    echo "🕷️  体育赛事爬虫 - 综合部署脚本 (完整版)"
+    echo "========================================="
     
-    echo "========================================="
-    echo "🕷️  体育赛事爬虫 - Linux服务器部署 (修复版)"
-    echo "========================================="
+    # 初始化日志
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 开始部署" > "$INSTALL_LOG"
     
     # 检查和准备
     check_required_files
@@ -850,40 +1006,12 @@ main() {
     # 运行测试
     run_deployment_test
     
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    echo ""
-    echo "========================================="
-    log_success "🎉 部署完成！(耗时: ${duration}秒)"
-    echo "========================================="
-    echo ""
-    echo "📋 管理命令:"
-    echo "  ./start.sh     - 启动服务"
-    echo "  ./stop.sh      - 停止服务"
-    echo "  ./restart.sh   - 重启服务"
-    echo "  ./status.sh    - 查看状态"
-    echo "  ./logs.sh      - 查看日志"
-    echo "  ./update.sh    - 更新代码"
-    echo ""
-    echo "📊 PM2 命令:"
-    echo "  pm2 status                    - 查看进程状态"
-    echo "  pm2 logs spider-server        - 查看实时日志"
-    echo "  pm2 monit                     - 进程监控"
-    echo "  pm2 restart spider-server     - 重启服务"
-    echo ""
-    echo "📁 项目目录: $PROJECT_DIR"
-    echo "📝 日志目录: $PROJECT_DIR/logs"
-    echo "⚙️  环境配置: $PROJECT_DIR/.env"
-    echo ""
-    echo "🔗 服务状态检查: ./status.sh"
-    echo "📊 监控URL: http://$(hostname -I | awk '{print $1}'):3000 (如果启用了Web监控)"
-    echo ""
-    echo "🔧 故障排除:"
-    echo "  - 查看日志: ./logs.sh pm2"
-    echo "  - 重启服务: ./restart.sh"
-    echo "  - 检查状态: ./status.sh"
+    # 显示总结
+    show_deployment_summary
 }
+
+# 错误处理
+trap 'error_exit "部署过程中发生未预期的错误"' ERR
 
 # 执行主函数
 main "$@" 
